@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -23,9 +23,25 @@ def load_replays(path: str | Path | None = None) -> list[dict[str, Any]]:
     return payload
 
 
+def is_ranked_replay(replay: dict[str, Any]) -> bool:
+    """Return True for replay records that are ranked and do not include unranked players."""
+    league = replay.get("league")
+    if isinstance(league, str) and league == "unranked-4":
+        return False
+
+    for player_key in ("player1", "player2"):
+        player = replay.get(player_key)
+        if isinstance(player, dict) and player.get("league") == "unranked-4":
+            return False
+
+    return True
+
+
 def iter_players(replays: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
-    """Yield player dictionaries from each replay."""
+    """Yield player dictionaries from each ranked replay."""
     for replay in replays:
+        if not is_ranked_replay(replay):
+            continue
         for player_key in ("player1", "player2"):
             player = replay.get(player_key)
             if isinstance(player, dict):
@@ -37,8 +53,13 @@ def count_replays(replays: list[dict[str, Any]]) -> int:
     return len(replays)
 
 
+def count_ranked_replays(replays: list[dict[str, Any]]) -> int:
+    """Return the number of ranked replay records."""
+    return sum(1 for replay in replays if is_ranked_replay(replay))
+
+
 def count_players_by_name(replays: list[dict[str, Any]]) -> Counter[str]:
-    """Count how often each player name appears across the replay set."""
+    """Count how often each player name appears across ranked replay records."""
     counts: Counter[str] = Counter()
     for player in iter_players(replays):
         name = player.get("name")
@@ -105,9 +126,11 @@ def get_matchup_key(replay: dict[str, Any]) -> str | None:
 
 
 def count_matchups(replays: list[dict[str, Any]]) -> Counter[str]:
-    """Count how many replays happened for each matchup."""
+    """Count how many ranked replays happened for each matchup."""
     counts: Counter[str] = Counter()
     for replay in replays:
+        if not is_ranked_replay(replay):
+            continue
         matchup = get_matchup_key(replay)
         if matchup:
             counts[matchup] += 1
@@ -115,9 +138,12 @@ def count_matchups(replays: list[dict[str, Any]]) -> Counter[str]:
 
 
 def calculate_matchup_win_rates(replays: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
-    """Calculate win rates for each race within each matchup."""
+    """Calculate win rates for each race within each ranked matchup."""
     matchup_stats: dict[str, dict[str, int]] = {}
     for replay in replays:
+        if not is_ranked_replay(replay):
+            continue
+
         matchup = get_matchup_key(replay)
         if not matchup:
             continue
@@ -162,11 +188,16 @@ def parse_replay_day(replay: dict[str, Any]) -> str | None:
 def build_player_race_mmr_by_day(replays: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Aggregate player race MMR by day for trend analysis."""
     grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    all_days: set[str] = set()
 
     for replay in replays:
+        if not is_ranked_replay(replay):
+            continue
+
         day = parse_replay_day(replay)
         if not day:
             continue
+        all_days.add(day)
 
         for player_key in ("player1", "player2"):
             player = replay.get(player_key)
@@ -193,23 +224,105 @@ def build_player_race_mmr_by_day(replays: list[dict[str, Any]]) -> list[dict[str
                 "winner": bool(player.get("winner")),
             })
 
+    if not all_days:
+        return []
+
+    global_start = min(all_days)
+    global_end = max(all_days)
+    global_start_date = datetime.strptime(global_start, "%Y-%m-%d")
+    global_end_date = datetime.strptime(global_end, "%Y-%m-%d")
+
     rows: list[dict[str, Any]] = []
-    for (player_name, race, day), entries in grouped.items():
-        mmrs = [entry["mmr"] for entry in entries]
-        rows.append({
-            "player_name": player_name,
-            "race": race,
-            "day": day,
-            "replay_count": len(entries),
-            "avg_mmr": sum(mmrs) / len(mmrs),
-            "min_mmr": min(mmrs),
-            "max_mmr": max(mmrs),
-            "wins": sum(1 for entry in entries if entry["winner"]),
-            "losses": sum(1 for entry in entries if not entry["winner"]),
-        })
+    player_day_keys = sorted(grouped)
+    player_days: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for player_name, race, day in player_day_keys:
+        player_days[(player_name, race)].append(day)
+
+    for (player_name, race), days in player_days.items():
+        sorted_days = sorted(set(days))
+        first_known_day = sorted_days[0]
+        first_known_entries = grouped[(player_name, race, first_known_day)]
+        first_known_mmr = sum(entry["mmr"] for entry in first_known_entries) / len(first_known_entries)
+
+        day = global_start_date
+        current_mmr: float | None = None
+        current_wins = 0
+        current_losses = 0
+
+        while day <= global_end_date:
+            day_str = day.strftime("%Y-%m-%d")
+            entries = grouped.get((player_name, race, day_str), [])
+
+            if entries:
+                mmrs = [entry["mmr"] for entry in entries]
+                current_mmr = sum(mmrs) / len(mmrs)
+                current_wins = sum(1 for entry in entries if entry["winner"])
+                current_losses = sum(1 for entry in entries if not entry["winner"])
+                replay_count = len(entries)
+            else:
+                replay_count = 0
+                current_wins = 0
+                current_losses = 0
+                if current_mmr is None and day_str <= first_known_day:
+                    current_mmr = first_known_mmr
+
+            rows.append({
+                "player_name": player_name,
+                "race": race,
+                "day": day_str,
+                "replay_count": replay_count,
+                "avg_mmr": current_mmr if current_mmr is not None else 0.0,
+                "min_mmr": current_mmr,
+                "max_mmr": current_mmr,
+                "wins": current_wins,
+                "losses": current_losses,
+            })
+
+            day += timedelta(days=1)
 
     rows.sort(key=lambda row: (row["player_name"], row["race"], row["day"]))
     return rows
+
+
+def calculate_top_race_mmr_movers(
+    rows: list[dict[str, Any]],
+    top_n: int = 10,
+    min_games: int = 10,
+) -> dict[str, list[dict[str, Any]]]:
+    """Identify the top player-race MMR movers by net movement."""
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if row["replay_count"] <= 0:
+            continue
+        groups[(row["player_name"], row["race"])].append(row)
+
+    movers: list[dict[str, Any]] = []
+    for (player_name, race), entries in groups.items():
+        sorted_entries = sorted(entries, key=lambda row: row["day"])
+        games = sum(row["replay_count"] for row in sorted_entries)
+        if games < min_games:
+            continue
+
+        first = sorted_entries[0]
+        last = sorted_entries[-1]
+        total_delta = float(last["avg_mmr"]) - float(first["avg_mmr"])
+        percentage_change = (total_delta / float(first["avg_mmr"])) * 100 if first["avg_mmr"] else None
+        movers.append({
+            "player_name": player_name,
+            "race": race,
+            "first_day": first["day"],
+            "last_day": last["day"],
+            "first_mmr": float(first["avg_mmr"]),
+            "last_mmr": float(last["avg_mmr"]),
+            "total_delta": total_delta,
+            "percentage_change": percentage_change,
+            "games": games,
+        })
+
+    movers.sort(key=lambda item: item["total_delta"], reverse=True)
+    upward = movers[:top_n]
+    downward = sorted(movers, key=lambda item: item["total_delta"])[:top_n]
+    return {"upward": upward, "downward": downward}
 
 
 def compare_patch_periods(rows: list[dict[str, Any]], patch_day: str) -> dict[str, Any]:
@@ -241,12 +354,15 @@ def compare_patch_periods(rows: list[dict[str, Any]], patch_day: str) -> dict[st
 
 def build_replay_summary(replays: list[dict[str, Any]]) -> dict[str, Any]:
     """Create a small data-only summary for later display or notebook use."""
+    rows = build_player_race_mmr_by_day(replays)
     return {
         "replay_count": count_replays(replays),
+        "ranked_replay_count": count_ranked_replays(replays),
         "player_count_by_name": count_players_by_name(replays),
         "matchup_counts": count_matchups(replays),
         "matchup_win_rates": calculate_matchup_win_rates(replays),
-        "player_race_mmr_by_day": build_player_race_mmr_by_day(replays),
+        "player_race_mmr_by_day": rows,
+        "top_race_mmr_movers": calculate_top_race_mmr_movers(rows, top_n=10, min_games=10),
     }
 
 
@@ -263,11 +379,11 @@ def print_summary(summary: dict[str, Any], limit: int = 10) -> None:
     for name, count in player_counts.most_common(limit):
         print(f"- {name}: {count}")
 
-    print("Top matchups by replay count:")
+    print("\nTop matchups by replay count:")
     for matchup, count in matchup_counts.most_common(limit):
         print(f"- {matchup}: {count}")
 
-    print("Matchup win rates:")
+    print("\nMatchup win rates:")
     for matchup, rates in sorted(matchup_win_rates.items()):
         if matchup[0] == matchup[-1]:
             continue
@@ -277,7 +393,7 @@ def print_summary(summary: dict[str, Any], limit: int = 10) -> None:
         print(f"- {matchup}: games={count} {formatted_rates}")
 
     if player_race_mmr_by_day:
-        print("Daily player-race MMR sample:")
+        print("\nDaily player-race MMR sample:")
         sample_rows = sorted(player_race_mmr_by_day, key=lambda row: row["replay_count"], reverse=True)
         for row in sample_rows[:limit]:
             print(
@@ -285,6 +401,40 @@ def print_summary(summary: dict[str, Any], limit: int = 10) -> None:
                 f"games={row['replay_count']} avg_mmr={row['avg_mmr']:.1f} "
                 f"wins={row['wins']} losses={row['losses']}"
             )
+
+    top_movers = summary.get("top_race_mmr_movers", {})
+    upward = top_movers.get("upward", [])
+    downward = top_movers.get("downward", [])
+    if upward or downward:
+        print("\nTop race-MMR movers:")
+        if upward:
+            print(f"\nTop {min(limit, len(upward))} upward movers:")
+            for mover in upward[:limit]:
+                change = mover["total_delta"]
+                pct = mover["percentage_change"]
+                pct_text = f"{pct:.1f}%" if pct is not None else "N/A"
+                print(
+                    f"- {mover['player_name']} ({mover['race']}): "
+                    f"{mover['first_day']}->{mover['last_day']} "
+                    f"{mover['first_mmr']:.1f}->{mover['last_mmr']:.1f} "
+                    f"delta={change:+.1f} "
+                    f"({pct_text}) "
+                    f"games={mover['games']}"
+                )
+        if downward:
+            print(f"\nTop {min(limit, len(downward))} downward movers:")
+            for mover in downward[:limit]:
+                change = mover["total_delta"]
+                pct = mover["percentage_change"]
+                pct_text = f"{pct:.1f}%" if pct is not None else "N/A"
+                print(
+                    f"- {mover['player_name']} ({mover['race']}): "
+                    f"{mover['first_day']}->{mover['last_day']} "
+                    f"{mover['first_mmr']:.1f}->{mover['last_mmr']:.1f} "
+                    f"delta={change:+.1f} "
+                    f"({pct_text}) "
+                    f"games={mover['games']}"
+                )
 
 
 def main() -> None:
