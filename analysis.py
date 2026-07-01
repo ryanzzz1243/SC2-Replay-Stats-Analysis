@@ -4,12 +4,13 @@ import json
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
+import re
 from typing import Any, Iterator
 
 DEFAULT_REPLAY_PATH = Path(__file__).resolve().parent / "replays.json"
 RACE_ORDER = {"Z": 0, "P": 1, "T": 2}
-BARCODE_NAMES = {"IIIIIIIIIIII", "llllllllllll", "IllllllllllI"}
-
+# Names that look like scanner/barcode garbage (e.g. I I I 1 l). Match full string.
+BARCODE_NAME_RE = re.compile(r"^[iIl1]+$")
 
 def load_replays(path: str | Path | None = None) -> list[dict[str, Any]]:
     """Load replay records from a JSON file."""
@@ -67,7 +68,7 @@ def count_players_by_name(replays: list[dict[str, Any]]) -> Counter[str]:
             continue
 
         cleaned_name = name.strip()
-        if not cleaned_name or cleaned_name in BARCODE_NAMES:
+        if not cleaned_name or BARCODE_NAME_RE.fullmatch(cleaned_name):
             continue
 
         counts[cleaned_name] += 1
@@ -211,7 +212,7 @@ def build_player_race_mmr_by_day(replays: list[dict[str, Any]]) -> list[dict[str
                 continue
 
             cleaned_name = player_name.strip()
-            if not cleaned_name or cleaned_name in BARCODE_NAMES:
+            if not cleaned_name or BARCODE_NAME_RE.fullmatch(cleaned_name):
                 continue
             if not race:
                 continue
@@ -305,15 +306,20 @@ def calculate_top_race_mmr_movers(
 
         first = sorted_entries[0]
         last = sorted_entries[-1]
-        total_delta = float(last["avg_mmr"]) - float(first["avg_mmr"])
-        percentage_change = (total_delta / float(first["avg_mmr"])) * 100 if first["avg_mmr"] else None
+        first_mmr = float(first["avg_mmr"])
+        last_mmr = float(last["avg_mmr"])
+        if first_mmr <= 2900 or last_mmr <= 2900:
+            continue
+
+        total_delta = last_mmr - first_mmr
+        percentage_change = (total_delta / first_mmr) * 100 if first_mmr else None
         movers.append({
             "player_name": player_name,
             "race": race,
             "first_day": first["day"],
             "last_day": last["day"],
-            "first_mmr": float(first["avg_mmr"]),
-            "last_mmr": float(last["avg_mmr"]),
+            "first_mmr": first_mmr,
+            "last_mmr": last_mmr,
             "total_delta": total_delta,
             "percentage_change": percentage_change,
             "games": games,
@@ -323,6 +329,91 @@ def calculate_top_race_mmr_movers(
     upward = movers[:top_n]
     downward = sorted(movers, key=lambda item: item["total_delta"])[:top_n]
     return {"upward": upward, "downward": downward}
+
+
+def get_latest_player_race_mmrs(replays: list[dict[str, Any]]) -> dict[str, list[int]]:
+    """Return latest MMR per player-race as a mapping race -> list of mmrs.
+
+    Keeps only ranked replays and ignores barcode-like player names.
+    """
+    latest: dict[tuple[str, str], tuple[datetime, int]] = {}
+    for replay in replays:
+        if not is_ranked_replay(replay):
+            continue
+
+        dt_text = replay.get("datetime")
+        try:
+            dt = datetime.strptime(dt_text, "%d %b, %Y %I:%M %p")
+        except Exception:
+            continue
+
+        for player_key in ("player1", "player2"):
+            player = replay.get(player_key)
+            if not isinstance(player, dict):
+                continue
+
+            name = player.get("name")
+            race = get_player_race(player)
+            mmr = player.get("mmr")
+            if not isinstance(name, str) or not race or not isinstance(mmr, int):
+                continue
+
+            cleaned_name = name.strip()
+            if not cleaned_name or BARCODE_NAME_RE.fullmatch(cleaned_name):
+                continue
+
+            key = (cleaned_name, race)
+            prev = latest.get(key)
+            if prev is None or dt > prev[0]:
+                latest[key] = (dt, mmr)
+
+    buckets: dict[str, list[int]] = defaultdict(list)
+    for (_name, race), (_dt, mmr) in latest.items():
+        buckets[race].append(mmr)
+
+    return buckets
+
+
+def compute_mmr_distribution_by_race(
+    replays: list[dict[str, Any]],
+    bin_size: int = 100,
+) -> dict[str, dict[str, Any]]:
+    """Compute an MMR histogram for each race.
+
+    Returns a mapping from race (Z/P/T) to a dict with keys:
+      - "counts": mapping of bin label to count
+      - "total": total number of MMR samples for that race
+    """
+    # Collect each player's latest MMR per race (one sample per player-race)
+    # Use helper that returns one latest MMR per player-race
+    mmr_buckets = get_latest_player_race_mmrs(replays)
+    distributions: dict[str, dict[str, Any]] = {}
+    for race, mmrs in mmr_buckets.items():
+        if not mmrs:
+            distributions[race] = {"counts": {}, "total": 0}
+            continue
+
+        min_mmr = min(mmrs)
+        max_mmr = max(mmrs)
+
+        start = (min_mmr // bin_size) * bin_size
+        end = ((max_mmr // bin_size) + 1) * bin_size
+
+        bins = list(range(start, end, bin_size))
+        labels = [f"{b}-{b + bin_size - 1}" for b in bins]
+
+        counts = {label: 0 for label in labels}
+        for m in mmrs:
+            idx = (m - start) // bin_size
+            if idx < 0:
+                idx = 0
+            if idx >= len(labels):
+                idx = len(labels) - 1
+            counts[labels[int(idx)]] += 1
+
+        distributions[race] = {"counts": counts, "total": len(mmrs)}
+
+    return distributions
 
 
 def compare_patch_periods(rows: list[dict[str, Any]], patch_day: str) -> dict[str, Any]:
@@ -363,6 +454,7 @@ def build_replay_summary(replays: list[dict[str, Any]]) -> dict[str, Any]:
         "matchup_win_rates": calculate_matchup_win_rates(replays),
         "player_race_mmr_by_day": rows,
         "top_race_mmr_movers": calculate_top_race_mmr_movers(rows, top_n=10, min_games=10),
+        "mmr_distribution_by_race": compute_mmr_distribution_by_race(replays),
     }
 
 
@@ -401,6 +493,28 @@ def print_summary(summary: dict[str, Any], limit: int = 10) -> None:
                 f"games={row['replay_count']} avg_mmr={row['avg_mmr']:.1f} "
                 f"wins={row['wins']} losses={row['losses']}"
             )
+
+    mmr_distribution = None # summary.get("mmr_distribution_by_race", {})
+    if mmr_distribution:
+        print("\nMMR distribution by race:")
+        for race in sorted(mmr_distribution):
+            data = mmr_distribution[race]
+            total = data.get("total", 0)
+            counts = data.get("counts", {})
+            print(f"- {race}: samples={total}")
+
+            nonzero = [(label, c) for label, c in counts.items() if c]
+            if not nonzero:
+                continue
+
+            # Sort bins by numeric start value of the label (e.g. '1200-1299')
+            try:
+                nonzero.sort(key=lambda item: int(item[0].split("-")[0]))
+            except Exception:
+                nonzero.sort()
+
+            for label, c in nonzero:
+                print(f"  {label}: {c}")
 
     top_movers = summary.get("top_race_mmr_movers", {})
     upward = top_movers.get("upward", [])

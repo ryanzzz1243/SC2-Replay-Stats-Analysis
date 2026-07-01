@@ -36,7 +36,7 @@ params = {
     "division": "-",
     "server": "-",
     "players_name": "",
-    "min_mmr": 3300,
+    "min_mmr": 2000,
     "max_mmr": "",
     "min_game_length": "-",
     "max_game_length": "-",
@@ -60,13 +60,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--max-pages',
         type=int,
-        default=200,
+        default=400,
         help='Maximum number of result pages to process',
     )
     parser.add_argument(
         '--cutoff-days',
         type=int,
-        default=14,
+        default=28,
         help='Stop when the oldest replay on a page is older than this many days',
     )
     return parser.parse_args()
