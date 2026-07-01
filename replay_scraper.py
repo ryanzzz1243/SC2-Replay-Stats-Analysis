@@ -1,8 +1,9 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
-from itertools import count
 import requests
 from bs4 import BeautifulSoup
 import json
@@ -69,6 +70,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=28,
         help='Stop when the oldest replay on a page is older than this many days',
+    )
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=12,
+        help='Number of worker threads used to fetch pages after page 0',
+    )
+    parser.add_argument(
+        '--retries',
+        type=int,
+        default=2,
+        help='Number of retries for failed page requests (max 2)',
     )
     return parser.parse_args()
 
@@ -139,65 +152,135 @@ def parse_row(row):
     return replay
 
 
+def fetch_page_html(page: int, use_cache: bool, retries: int) -> str | None:
+    page_params = dict(params)
+    page_params['page'] = page
+    cache_file = cache_dir / f"replays_page_{page}.html"
+
+    if not use_cache or not cache_file.exists():
+        attempts = retries + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                response = requests.get(url, headers=headers, params=page_params, timeout=30)
+                print(f"page={page} status={response.status_code} attempt={attempt}/{attempts}")
+                if response.status_code == 200:
+                    page_html = response.text
+                    cache_file.write_text(page_html, encoding='utf-8')
+                    return page_html
+            except requests.RequestException as exc:
+                print(f"page={page} request error attempt={attempt}/{attempts}: {exc}")
+
+            if attempt < attempts:
+                backoff_seconds = 0.75 * (2 ** (attempt - 1))
+                time.sleep(backoff_seconds)
+
+        print(f"page={page} failed after {retries} retries")
+        return None
+
+    print(f"page={page} loading from cache")
+    return cache_file.read_text(encoding='utf-8')
+
+
+def parse_total_replays(soup: BeautifulSoup) -> int | None:
+    total_span = soup.select_one('section.sc2-panel.results-panel .results-toolbar span strong')
+    if not total_span:
+        return None
+    try:
+        return int(total_span.get_text(strip=True).replace(',', ''))
+    except ValueError:
+        return None
+
+
+def parse_page(page: int, page_html: str):
+    soup = BeautifulSoup(page_html, 'html.parser')
+    page_rows = soup.select('section.sc2-panel.results-panel table.table tbody tr')
+    if not page_rows:
+        return {
+            'page': page,
+            'rows': 0,
+            'replays': [],
+            'oldest': None,
+        }
+
+    page_replays = []
+    page_oldest = None
+    for row in page_rows:
+        replay_data = parse_row(row)
+        if not replay_data:
+            continue
+
+        replay_date = None
+        replay_date_text = replay_data.get('datetime') or replay_data.get('date')
+        try:
+            replay_date = datetime.strptime(replay_date_text, '%d %b, %Y %I:%M %p').replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            pass
+
+        if replay_date is not None:
+            if page_oldest is None or replay_date < page_oldest:
+                page_oldest = replay_date
+
+        page_replays.append(replay_data)
+
+    return {
+        'page': page,
+        'rows': len(page_rows),
+        'replays': page_replays,
+        'oldest': page_oldest,
+    }
+
+
 def main() -> None:
     args = parse_args()
     args.max_pages = max(0, args.max_pages)
+    args.workers = max(1, args.workers)
+    args.retries = min(2, max(0, args.retries))
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=args.cutoff_days)
     all_replays = []
 
-    page_iter = range(args.max_pages) if args.max_pages > 0 else count(0)
-    for page in page_iter:
-        params['page'] = page
-        cache_file = cache_dir / f"replays_page_{page}.html"
+    first_page_html = fetch_page_html(0, args.use_cache, args.retries)
+    if first_page_html is None:
+        print('Stopping: unable to fetch page 0')
+        return
 
-        if not args.use_cache or not cache_file.exists():
-            response = requests.get(url, headers=headers, params=params)
-            print(f"page={page} status={response.status_code}")
-            if response.status_code != 200:
-                print(f"Stopping: HTTP {response.status_code}")
-                break
-            page_html = response.text
-            cache_file.write_text(page_html, encoding='utf-8')
-        else:
-            print(f"page={page} loading from cache")
-            page_html = cache_file.read_text(encoding='utf-8')
+    first_page_soup = BeautifulSoup(first_page_html, 'html.parser')
+    total_replays = parse_total_replays(first_page_soup)
+    if total_replays is None:
+        print('Stopping: unable to determine total replay count from page 0')
+        return
 
-        soup = BeautifulSoup(page_html, 'html.parser')
-        if page == 0 and not args.use_cache:
-            total_span = soup.select_one('section.sc2-panel.results-panel .results-toolbar span strong')
-            if total_span:
-                try:
-                    total_replays = int(total_span.get_text(strip=True).replace(',', ''))
-                    print(f"total_replays={total_replays}")
-                except ValueError:
-                    total_replays = None
+    total_pages = (total_replays + 49) // 50
+    if args.max_pages > 0:
+        total_pages = min(total_pages, args.max_pages)
 
-        page_rows = soup.select('section.sc2-panel.results-panel table.table tbody tr')
-        if not page_rows:
+    print(f"total_replays={total_replays} total_pages={total_pages}")
+
+    parsed_pages = {}
+    parsed_pages[0] = parse_page(0, first_page_html)
+
+    remaining_pages = list(range(1, total_pages))
+    if remaining_pages:
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            future_to_page = {
+                executor.submit(fetch_page_html, page, args.use_cache, args.retries): page for page in remaining_pages
+            }
+            for future in as_completed(future_to_page):
+                page = future_to_page[future]
+                page_html = future.result()
+                if page_html is None:
+                    continue
+                parsed_pages[page] = parse_page(page, page_html)
+
+    for page in sorted(parsed_pages):
+        page_data = parsed_pages[page]
+        if page_data['rows'] == 0:
             print(f"Stopping: no rows found on page {page}")
             break
 
-        page_oldest = None
-        for row in page_rows:
-            replay_data = parse_row(row)
-            if not replay_data:
-                continue
+        all_replays.extend(page_data['replays'])
+        print(f"page={page} parsed {page_data['rows']} rows, total {len(all_replays)}")
 
-            replay_date = None
-            replay_date_text = replay_data.get('datetime') or replay_data.get('date')
-            try:
-                replay_date = datetime.strptime(replay_date_text, '%d %b, %Y %I:%M %p').replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
-                pass
-
-            if replay_date is not None:
-                if page_oldest is None or replay_date < page_oldest:
-                    page_oldest = replay_date
-
-            all_replays.append(replay_data)
-
-        print(f"page={page} parsed {len(page_rows)} rows, total {len(all_replays)}")
-
+        page_oldest = page_data['oldest']
         if page_oldest is not None and page_oldest < cutoff_date:
             print(f"Stopping: oldest replay on page {page} is {page_oldest.isoformat()}, older than cutoff {cutoff_date.isoformat()}")
             break
