@@ -2,6 +2,7 @@ import argparse
 import os
 import re
 from datetime import datetime, timedelta, timezone
+from itertools import count
 import requests
 from bs4 import BeautifulSoup
 import json
@@ -36,7 +37,7 @@ params = {
     "division": "-",
     "server": "-",
     "players_name": "",
-    "min_mmr": 2000,
+    "min_mmr": 100,
     "max_mmr": "",
     "min_game_length": "-",
     "max_game_length": "-",
@@ -60,8 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--max-pages',
         type=int,
-        default=400,
-        help='Maximum number of result pages to process',
+        default=0,
+        help='Maximum number of result pages to process (0 means no limit)',
     )
     parser.add_argument(
         '--cutoff-days',
@@ -111,11 +112,16 @@ def parse_row(row):
     if len(cells) < 5:
         return None
 
+    player1 = parse_player_cell(cells[1])
+    player2 = parse_player_cell(cells[2])
+    if player1.get('mmr') == 0 or player2.get('mmr') == 0:
+        return None
+
     date_cell = cells[0]
     replay = {
         'datetime': date_cell.get_text(strip=True),
-        'player1': parse_player_cell(cells[1]),
-        'player2': parse_player_cell(cells[2]),
+        'player1': player1,
+        'player2': player2,
         'duration': cells[3].get_text(strip=True),
         'view_url': None,
         'download_url': None,
@@ -135,10 +141,12 @@ def parse_row(row):
 
 def main() -> None:
     args = parse_args()
+    args.max_pages = max(0, args.max_pages)
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=args.cutoff_days)
     all_replays = []
 
-    for page in range(args.max_pages):
+    page_iter = range(args.max_pages) if args.max_pages > 0 else count(0)
+    for page in page_iter:
         params['page'] = page
         cache_file = cache_dir / f"replays_page_{page}.html"
 
